@@ -12,6 +12,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Tools/LayoutUtils.h"
 #include "llvm/Support/ErrorHandling.h"
 
 namespace mlir {
@@ -25,7 +26,7 @@ namespace {
 
 static void
 lowerTMALoad(Operation *op, RankedTensorType tensorType, Value desc,
-             function_ref<void(Value, Value, Value, Value)> createLoad,
+             function_ref<void(Value, Value, Value, Value, bool)> createLoad,
              PatternRewriter &rewriter) {
   MLIRContext *ctx = op->getContext();
   Attribute sharedMemorySpace = triton::gpu::SharedMemorySpaceAttr::get(ctx);
@@ -37,13 +38,28 @@ lowerTMALoad(Operation *op, RankedTensorType tensorType, Value desc,
   auto alloc =
       gpu::LocalAllocOp::create(rewriter, loc, memDescType).getResult();
   auto numCTAs = gpu::lookupNumCTAs(op);
-  auto barrierCGALayout =
-      gpu::CGAEncodingAttr::get1DLayout(tensorType.getContext(), numCTAs);
+  bool useTwoCTABarrier = triton::valueFeedsTwoCTAMMA(op->getResult(0));
+  bool useMulticast =
+      isa<DescriptorLoadOp>(op) && useTwoCTABarrier &&
+      hasCGABroadcast(memDescType) &&
+      llvm::any_of(op->getResults(), triton::valueFeedsMulticastMMA);
+  auto barrierCGALayout = [&]() -> gpu::CGAEncodingAttr {
+    if (!useTwoCTABarrier)
+      return gpu::CGAEncodingAttr::get1DLayout(tensorType.getContext(),
+                                               numCTAs);
+    auto kBlock = StringAttr::get(ctx, "block");
+    auto dim = standardOutDimNames(ctx, /*rank=*/1)[0];
+    return gpu::CGAEncodingAttr::get(
+        ctx, LinearLayout::zeros1D(2, kBlock, dim) *
+                 LinearLayout::identity1D(numCTAs / 2, kBlock, dim));
+  }();
   auto barrierEncoding = gpu::SwizzledSharedEncodingAttr::get(
       tensorType.getContext(), 1, 1, 1, {0}, barrierCGALayout);
+  auto numBarrierSlots = useTwoCTABarrier ? numCTAs / 2 : numCTAs;
   gpu::MemDescType barrierMemDescType =
-      gpu::MemDescType::get({numCTAs}, rewriter.getI64Type(), barrierEncoding,
-                            sharedMemorySpace, /*mutableMemory=*/true);
+      gpu::MemDescType::get({numBarrierSlots}, rewriter.getI64Type(),
+                            barrierEncoding, sharedMemorySpace,
+                            /*mutableMemory=*/true);
   Value barrierAlloc =
       gpu::LocalAllocOp::create(rewriter, loc, barrierMemDescType);
   InitBarrierOp::create(rewriter, loc, barrierAlloc, 1);
@@ -53,7 +69,7 @@ lowerTMALoad(Operation *op, RankedTensorType tensorType, Value desc,
   Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
   triton::nvidia_gpu::BarrierExpectOp::create(rewriter, loc, barrierAlloc,
                                               sizeInBytes, pred);
-  createLoad(desc, barrierAlloc, alloc, pred);
+  createLoad(desc, barrierAlloc, alloc, pred, useMulticast);
   Value phase = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
   WaitBarrierOp::create(rewriter, loc, barrierAlloc, phase);
   InvalBarrierOp::create(rewriter, loc, barrierAlloc);
@@ -68,10 +84,10 @@ public:
   LogicalResult matchAndRewrite(DescriptorLoadOp op,
                                 PatternRewriter &rewriter) const override {
     auto createLoad = [&](Value desc, Value barrierAlloc, Value alloc,
-                          Value pred) {
+                          Value pred, bool useMulticast) {
       triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp::create(
           rewriter, op.getLoc(), desc, op.getIndices(), barrierAlloc, alloc,
-          pred);
+          pred, useMulticast);
     };
     lowerTMALoad(op, op.getType(), op.getDesc(), createLoad, rewriter);
     return success();
@@ -87,10 +103,11 @@ struct TMAGatherLowering : public OpRewritePattern<DescriptorGatherOp> {
         sextI16ToI32Indices(op.getXOffsets(), rewriter, op.getLoc());
 
     auto createLoad = [&](Value desc, Value barrierAlloc, Value alloc,
-                          Value pred) {
+                          Value pred, bool useMulticast) {
       triton::nvidia_gpu::AsyncTMAGatherOp::create(rewriter, op.getLoc(), desc,
                                                    xOffsets, op.getYOffset(),
-                                                   barrierAlloc, alloc, pred);
+                                                   barrierAlloc, alloc, pred,
+                                                   useMulticast);
     };
     lowerTMALoad(op, op.getType(), op.getDesc(), createLoad, rewriter);
     return success();
